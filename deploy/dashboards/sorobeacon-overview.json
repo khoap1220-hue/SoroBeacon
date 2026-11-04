@@ -1,0 +1,61 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "title": "SoroBeacon / Overview & Operations",
+  "tags": [
+    "sorobeacon",
+    "operations",
+    "alerts",
+    "stellar"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "title": "Alert Ingestion Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(sorobeacon_alerts_ingested_total[5m])) by (workspace)",
+          "legendFormat": "{{workspace}}"
+        }
+      ]
+    },
+    {
+      "title": "Active Firing Alerts",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(sorobeacon_alerts_active{state=\"firing\"}) by (severity)",
+          "legendFormat": "{{severity}}"
+        }
+      ]
+    },
+    {
+      "title": "Poller Duration (P99)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(sorobeacon_poller_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "Database Connection Pool Saturation",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "sorobeacon_db_pool_open_connections / sorobeacon_db_pool_max_connections",
+          "legendFormat": "saturation"
+        }
+      ]
+    }
+  ]
+}
