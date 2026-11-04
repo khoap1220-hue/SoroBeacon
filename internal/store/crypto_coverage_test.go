@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"crypto/rand"
-	"reflect"
 	"testing"
 )
 
