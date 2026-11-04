@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"crypto/rand"
-	"fmt"
 	"testing"
 )
 
@@ -90,10 +89,6 @@ func TestTamperDetection(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected decryption error on tampered ciphertext, got nil")
 	}
-}
-
-func channelRef(id int64, name string) string {
-	return fmt.Sprintf("channel:%d:%s", id, name)
 }
 
 // TestZeroSecretLeakage verifies that logging, errors, and string conversions
