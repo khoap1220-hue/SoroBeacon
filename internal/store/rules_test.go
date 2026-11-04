@@ -203,3 +203,35 @@ func TestRuleCreateUnknownMonitor(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound, "the FK violation maps to ErrNotFound")
 	assert.Zero(t, r.ID, "a rejected insert must not fill in an id")
 }
+
+
+func TestRuleSeverityRoundTripSQLite(t *testing.T) {
+	st := newTestSQLite(t)
+	ctx := context.Background()
+	m := &Monitor{Name: "sev-mon", ContractIDs: []string{"CAAA"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	r := &Rule{
+		MonitorID: m.ID,
+		Type:      "event_emitted",
+		Params:    json.RawMessage(`{"event_name":"transfer"}`),
+		Enabled:   true,
+		Severity:  SeverityCritical,
+	}
+	require.NoError(t, st.CreateRule(ctx, r))
+
+	got, err := st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityCritical, got.Severity, "GetRule must read back persisted rule severity")
+
+	list, err := st.ListRules(ctx, m.ID, false)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, SeverityCritical, list[0].Severity, "ListRules must read back persisted rule severity")
+
+	r.Severity = SeverityInfo
+	require.NoError(t, st.UpdateRule(ctx, r))
+	gotAfter, err := st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityInfo, gotAfter.Severity, "UpdateRule must persist updated severity")
+}
