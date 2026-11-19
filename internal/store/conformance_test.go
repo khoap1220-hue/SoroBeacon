@@ -56,6 +56,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ListMonitorsPageSearchFilterSort", func(t *testing.T) { testListMonitorsPage(t, newStore) })
 	t.Run("MonitorTagsNormaliseFilterUpdateAndDuplicate", func(t *testing.T) { testMonitorTags(t, newStore) })
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
+	t.Run("RuleSeverityRoundTripAndAlertInheritance", func(t *testing.T) { testRuleSeverityRoundTrip(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("CreateMonitorWithRulesIsAtomic", func(t *testing.T) { testCreateMonitorWithRules(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
@@ -688,6 +689,88 @@ func testRuleCRUD(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, st.DeleteMonitor(ctx, m.ID))
 	_, err = st.GetRule(ctx, r.ID)
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// testRuleSeverityRoundTrip pins rules.severity across every write and read
+// path on both backends — CreateRule, GetRule, ListRules, UpdateRule,
+// CreateRules, CreateMonitorWithRules, DuplicateMonitor — and checks that an
+// alert created from a rule inherits the stored severity.
+func testRuleSeverityRoundTrip(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "sev-mon", ContractIDs: []string{"CAAA"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	// A rule created without an explicit severity receives the column default.
+	defRule := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"mint"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, defRule))
+	gotDef, err := st.GetRule(ctx, defRule.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityWarning, gotDef.Severity)
+
+	// Non-default severity persists through CreateRule, GetRule, and ListRules.
+	crit := &Rule{
+		MonitorID: m.ID,
+		Type:      "event_emitted",
+		Params:    json.RawMessage(`{"event_name":"transfer"}`),
+		Enabled:   true,
+		Severity:  SeverityCritical,
+	}
+	require.NoError(t, st.CreateRule(ctx, crit))
+
+	got, err := st.GetRule(ctx, crit.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityCritical, got.Severity)
+
+	// An alert created without an explicit severity copies the rule's stored severity.
+	alert := &Alert{MonitorID: m.ID, RuleID: crit.ID, EventID: "ev-crit-1"}
+	outcome, err := st.CreateAlert(ctx, alert)
+	require.NoError(t, err)
+	require.Equal(t, AlertCreated, outcome)
+	assert.Equal(t, SeverityCritical, alert.Severity)
+
+	// UpdateRule persists a new severity both when condition is unchanged and when params change.
+	crit.Severity = SeverityInfo
+	require.NoError(t, st.UpdateRule(ctx, crit))
+	got, err = st.GetRule(ctx, crit.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityInfo, got.Severity)
+
+	crit.Params = json.RawMessage(`{"event_name":"burn"}`)
+	crit.Severity = SeverityCritical
+	require.NoError(t, st.UpdateRule(ctx, crit))
+	got, err = st.GetRule(ctx, crit.ID)
+	require.NoError(t, err)
+	assert.Equal(t, SeverityCritical, got.Severity)
+
+	// DuplicateMonitor carries each rule's severity onto the copied monitor.
+	dup, err := st.DuplicateMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	dupRules, err := st.ListRules(ctx, dup.ID, false)
+	require.NoError(t, err)
+	require.Len(t, dupRules, 2)
+	assert.Equal(t, SeverityWarning, dupRules[0].Severity)
+	assert.Equal(t, SeverityCritical, dupRules[1].Severity)
+
+	// Batch CreateRules and CreateMonitorWithRules also persist rule severity.
+	batchMon := &Monitor{Name: "sev-batch", ContractIDs: []string{"CBBB"}, Enabled: true}
+	batchRules := []*Rule{
+		{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"a"}`), Enabled: true, Severity: SeverityInfo},
+		{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"b"}`), Enabled: true, Severity: SeverityCritical},
+	}
+	require.NoError(t, st.CreateMonitorWithRules(ctx, batchMon, batchRules, nil))
+	more := []*Rule{
+		{MonitorID: batchMon.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"c"}`), Enabled: true, Severity: SeverityCritical},
+	}
+	require.NoError(t, st.CreateRules(ctx, more))
+
+	listed, err := st.ListRules(ctx, batchMon.ID, false)
+	require.NoError(t, err)
+	require.Len(t, listed, 3)
+	assert.Equal(t, SeverityInfo, listed[0].Severity)
+	assert.Equal(t, SeverityCritical, listed[1].Severity)
+	assert.Equal(t, SeverityCritical, listed[2].Severity)
 }
 
 func testCreateRulesAtomic(t *testing.T, newStore conformanceFactory) {
