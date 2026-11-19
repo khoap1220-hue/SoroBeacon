@@ -357,14 +357,14 @@ func TestAuditGRPCServiceDescCoversEveryRPC(t *testing.T) {
 
 // TestAdminActionAuditEndToEnd_SucceededFailedSecretsActorTypeAndWorkspaceScoping
 // verifies on a real SQLite store:
-// 1. Succeeded and failed administrative actions (401, 403, 404, 400) are recorded with
-//    actor, actor_type (person vs automation vs anonymous), action, target_type, target_id,
-//    resource_id, workspace_id, source_ip, surface, outcome, status_code, reason, and
-//    tamper-evident hash chain (prev_hash, record_hash).
-// 2. Rejected attempt to revoke another workspace's token is recorded as a failed audit entry.
-// 3. Channel config / token secrets never appear in audit records.
-// 4. Workspace scoping: a tenant sees only its own audit records, while an operator
-//    (cross-workspace static admin token with ?all_workspaces=true or ?workspace=beta) sees all.
+//  1. Succeeded and failed administrative actions (401, 403, 404, 400) are recorded with
+//     actor, actor_type (person vs automation vs anonymous), action, target_type, target_id,
+//     resource_id, workspace_id, source_ip, surface, outcome, status_code, reason, and
+//     tamper-evident hash chain (prev_hash, record_hash).
+//  2. Rejected attempt to revoke another workspace's token is recorded as a failed audit entry.
+//  3. Channel config / token secrets never appear in audit records.
+//  4. Workspace scoping: a tenant sees only its own audit records, while an operator
+//     (cross-workspace static admin token with ?all_workspaces=true or ?workspace=beta) sees all.
 func TestAdminActionAuditEndToEnd_SucceededFailedSecretsActorTypeAndWorkspaceScoping(t *testing.T) {
 	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "audit-e2e.db")
 	require.NoError(t, store.Migrate(dbURL))
@@ -597,4 +597,117 @@ func TestAllowUnauthenticatedAuditWrite_RateLimits401BurstWhileRecording403(t *t
 	require.LessOrEqual(t, len(entries), 53)
 	assert.Equal(t, http.StatusForbidden, entries[0].StatusCode)
 	assert.Equal(t, http.StatusUnauthorized, entries[1].StatusCode)
+}
+
+// TestAuditMiddlewareMountedUnderPrefix drives apiSrv.Routes() mounted under
+// /api/v1 (matching cmd/sorobeacon/main.go) and under a multi-segment prefix,
+// verifying create/update/delete entries, exempt and unmatched 404 exclusions,
+// secret redaction, and that GET /api/v1/audit returns both dashboard and API entries.
+func TestAuditMiddlewareMountedUnderPrefix(t *testing.T) {
+	for _, prefix := range []string{"/api/v1", "/edge/api/v2"} {
+		t.Run(prefix, func(t *testing.T) {
+			dbURL := "sqlite://" + filepath.Join(t.TempDir(), "audit-mounted.db")
+			require.NoError(t, store.Migrate(dbURL))
+			st, err := store.NewSQLite(context.Background(), dbURL)
+			require.NoError(t, err)
+			t.Cleanup(st.Close)
+
+			const adminTok = "mounted-admin-token"
+			authn := auth.NewBound([]auth.Binding{
+				{Workspace: workspace.Default, Token: adminTok + ":admin"},
+			}, time.Hour)
+
+			apiSrv := New(st, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+				WithAuth(authn)
+
+			root := chi.NewRouter()
+			root.Mount(prefix, apiSrv.Routes())
+			srv := httptest.NewServer(root)
+			t.Cleanup(srv.Close)
+
+			// Seed a dashboard entry directly so GET /audit must return both surfaces.
+			require.NoError(t, st.CreateAuditEntry(context.Background(), &store.AuditEntry{
+				Actor:      "operator-ui",
+				ActorType:  store.AuditActorPerson,
+				Action:     store.AuditActionCreate,
+				TargetType: store.AuditTargetMonitor,
+				TargetID:   99,
+				Surface:    store.AuditSurfaceDashboard,
+				Outcome:    store.AuditOutcomeSucceeded,
+				StatusCode: http.StatusSeeOther,
+				Diff:       json.RawMessage(`{"fields":["name"]}`),
+			}))
+
+			hdrs := map[string]string{"Authorization": "Bearer " + adminTok}
+
+			// 1. POST <prefix>/monitors writes one create entry with the new monitor id.
+			res, raw := do(t, http.MethodPost, srv.URL+prefix+"/monitors",
+				`{"name":"mounted-mon","contract_ids":["`+validContract+`"],"enabled":true}`, hdrs)
+			require.Equal(t, http.StatusCreated, res.StatusCode, string(raw))
+			var createdMon store.Monitor
+			require.NoError(t, json.Unmarshal(raw, &createdMon))
+			require.NotZero(t, createdMon.ID)
+
+			// 2. PATCH <prefix>/monitors/{id} writes one update entry.
+			monPath := srv.URL + prefix + "/monitors/" + itoa(createdMon.ID)
+			res, raw = do(t, http.MethodPatch, monPath, `{"name":"mounted-mon-v2"}`, hdrs)
+			require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+
+			// 3. Create a channel with a secret config and verify the test-send route stays exempt.
+			const secretURL = "https://hooks.slack.com/services/T000/B000/MOUNTED-SECRET-TOKEN"
+			res, raw = do(t, http.MethodPost, srv.URL+prefix+"/channels",
+				`{"name":"ops","type":"slack","config":{"webhook_url":"`+secretURL+`"}}`, hdrs)
+			require.Equal(t, http.StatusCreated, res.StatusCode, string(raw))
+			var createdCh store.Channel
+			require.NoError(t, json.Unmarshal(raw, &createdCh))
+
+			// Operational test-send route under the mounted prefix remains exempt from audit logging.
+			_, _ = do(t, http.MethodPost, srv.URL+prefix+"/channels/"+itoa(createdCh.ID)+"/test", `{}`, hdrs)
+
+			// Unmatched 404 path inside a mounted subroute must not synthesize a monitor create/update row.
+			res, _ = do(t, http.MethodPost, monPath+"/unknown-subpath", `{}`, hdrs)
+			require.Equal(t, http.StatusNotFound, res.StatusCode)
+
+			// 4. DELETE <prefix>/monitors/{id} writes one delete entry.
+			res, _ = do(t, http.MethodDelete, monPath, "", hdrs)
+			require.Equal(t, http.StatusNoContent, res.StatusCode)
+
+			// 5. GET <prefix>/audit answers the entries both dashboard and API wrote.
+			res, raw = do(t, http.MethodGet, srv.URL+prefix+"/audit", "", hdrs)
+			require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+			require.NotContains(t, string(raw), secretURL)
+
+			var list struct {
+				Entries []store.AuditEntry `json:"entries"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &list))
+			// Expected newest-first:
+			// [0] DELETE monitor (rest)
+			// [1] POST channel (rest)
+			// [2] PATCH monitor (rest)
+			// [3] POST monitor (rest)
+			// [4] create monitor (dashboard)
+			require.Len(t, list.Entries, 5)
+
+			assert.Equal(t, store.AuditActionDelete, list.Entries[0].Action)
+			assert.Equal(t, store.AuditTargetMonitor, list.Entries[0].TargetType)
+			assert.Equal(t, createdMon.ID, list.Entries[0].TargetID)
+			assert.Equal(t, store.AuditSurfaceREST, list.Entries[0].Surface)
+
+			assert.Equal(t, store.AuditActionCreate, list.Entries[1].Action)
+			assert.Equal(t, store.AuditTargetChannel, list.Entries[1].TargetType)
+			assert.Equal(t, createdCh.ID, list.Entries[1].TargetID)
+
+			assert.Equal(t, store.AuditActionUpdate, list.Entries[2].Action)
+			assert.Equal(t, store.AuditTargetMonitor, list.Entries[2].TargetType)
+			assert.Equal(t, createdMon.ID, list.Entries[2].TargetID)
+
+			assert.Equal(t, store.AuditActionCreate, list.Entries[3].Action)
+			assert.Equal(t, store.AuditTargetMonitor, list.Entries[3].TargetType)
+			assert.Equal(t, createdMon.ID, list.Entries[3].TargetID)
+
+			assert.Equal(t, store.AuditSurfaceDashboard, list.Entries[4].Surface)
+			assert.Equal(t, int64(99), list.Entries[4].TargetID)
+		})
+	}
 }

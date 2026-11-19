@@ -34,12 +34,12 @@ type AuditRouteSpec struct {
 // entry in either AuditRouteTable or AuditExemptRESTRoutes.
 var AuditRouteTable = auth.NewRouteTable(map[string]AuditRouteSpec{
 	// Monitors
-	"POST /monitors":                 {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
-	"PATCH /monitors/{id}":           {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
-	"DELETE /monitors/{id}":          {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
+	"POST /monitors":                  {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
+	"PATCH /monitors/{id}":            {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"DELETE /monitors/{id}":           {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
 	"POST /monitors/{id}/soft-delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/restore":    {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/duplicate":  {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/restore":     {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/duplicate":   {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
 
 	// Rules
 	"POST /monitors/{id}/rules":            {Action: store.AuditActionCreate, TargetType: store.AuditTargetRule},
@@ -52,11 +52,11 @@ var AuditRouteTable = auth.NewRouteTable(map[string]AuditRouteSpec{
 	"DELETE /monitors/{id}/escalation": {Action: store.AuditActionDelete, TargetType: store.AuditTargetEscalationPolicy},
 
 	// Channels & webhook signing keys
-	"POST /channels":                         {Action: store.AuditActionCreate, TargetType: store.AuditTargetChannel},
-	"PATCH /channels/{id}":                   {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
-	"DELETE /channels/{id}":                  {Action: store.AuditActionDelete, TargetType: store.AuditTargetChannel},
-	"POST /channels/{id}/duplicate":          {Action: store.AuditActionCreate, TargetType: store.AuditTargetChannel},
-	"POST /channels/{id}/keys/rotate":        {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
+	"POST /channels":                          {Action: store.AuditActionCreate, TargetType: store.AuditTargetChannel},
+	"PATCH /channels/{id}":                    {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
+	"DELETE /channels/{id}":                   {Action: store.AuditActionDelete, TargetType: store.AuditTargetChannel},
+	"POST /channels/{id}/duplicate":           {Action: store.AuditActionCreate, TargetType: store.AuditTargetChannel},
+	"POST /channels/{id}/keys/rotate":         {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
 	"POST /channels/{id}/keys/{keyID}/retire": {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
 	"POST /channels/{id}/keys/{keyID}/revoke": {Action: store.AuditActionUpdate, TargetType: store.AuditTargetChannel},
 
@@ -106,14 +106,14 @@ var AuditRouteTable = auth.NewRouteTable(map[string]AuditRouteSpec{
 // test-sends, read-only dry-runs, data-plane event ingestion, and bulk enable/disable
 // toggles). Every entry must carry a non-empty justification.
 var AuditExemptRESTRoutes = map[string]string{
-	"POST /monitors/bulk":                           "Bulk enable/disable toggle; pinned by TestNonConfigMutationsAreNotAudited.",
-	"POST /channels/bulk":                           "Bulk enable/disable toggle for channels.",
-	"POST /monitors/import":                         "Batch contract CSV/JSON import helper; pinned by TestNonConfigMutationsAreNotAudited.",
-	"POST /monitors/{id}/rules/dry-run":             "Read-only historical rule dry-run simulation; mutates no persistent state.",
-	"POST /channels/{id}/test":                      "Operational test notification send; mutates no channel configuration.",
+	"POST /monitors/bulk":                            "Bulk enable/disable toggle; pinned by TestNonConfigMutationsAreNotAudited.",
+	"POST /channels/bulk":                            "Bulk enable/disable toggle for channels.",
+	"POST /monitors/import":                          "Batch contract CSV/JSON import helper; pinned by TestNonConfigMutationsAreNotAudited.",
+	"POST /monitors/{id}/rules/dry-run":              "Read-only historical rule dry-run simulation; mutates no persistent state.",
+	"POST /channels/{id}/test":                       "Operational test notification send; mutates no channel configuration.",
 	"POST /alerts/{id}/deliveries/{channelID}/retry": "Operational alert delivery retry; mutates no configuration.",
-	"POST /ingest":                                  "Data-plane federated/webhook event ingestion endpoint.",
-	"POST /triggers":                                "Data-plane external event trigger ingestion endpoint.",
+	"POST /ingest":                                   "Data-plane federated/webhook event ingestion endpoint.",
+	"POST /triggers":                                 "Data-plane external event trigger ingestion endpoint.",
 }
 
 var auditExemptRESTTable = auth.NewRouteTable(AuditExemptRESTRoutes)
@@ -238,6 +238,10 @@ func AuditMiddlewareWithOptions(st store.Store, trustForwarded bool, log *slog.L
 			if trace, ok := r.Context().Value(auditTraceCtxKey{}).(*auditTrace); ok {
 				trace.handled = true
 			}
+			mountDepth := 0
+			if rctx := chi.RouteContext(r.Context()); rctx != nil {
+				mountDepth = len(rctx.RoutePatterns)
+			}
 			// chi matches the route inside the handler chain, so the route
 			// pattern is only populated after next returns; the body must be
 			// read (and restored) before the handler consumes it.
@@ -261,7 +265,7 @@ func AuditMiddlewareWithOptions(st store.Store, trustForwarded bool, log *slog.L
 				return
 			}
 
-			spec, ok := auditRoute(r.Method, auditRoutePattern(r))
+			spec, ok := auditRoute(r.Method, auditSubrouterPattern(r, mountDepth))
 			if !ok {
 				return
 			}
@@ -438,11 +442,38 @@ func mutatingMethod(method string) bool {
 	}
 }
 
-func auditRoutePattern(r *http.Request) string {
-	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+// auditSubrouterPattern reconstructs the matched route pattern relative to the
+// router AuditMiddleware was installed on, stripping any outer chi.Mount or
+// chi.Route prefixes recorded before the middleware ran (such as
+// root.Mount("/api/v1", apiSrv.Routes()) in cmd/sorobeacon).
+func auditSubrouterPattern(r *http.Request, mountDepth int) string {
+	rctx := chi.RouteContext(r.Context())
+	if rctx == nil {
+		return ""
+	}
+	if mountDepth <= 0 {
+		if len(rctx.RoutePatterns) > 0 && strings.HasSuffix(rctx.RoutePatterns[len(rctx.RoutePatterns)-1], "*") {
+			return ""
+		}
 		return rctx.RoutePattern()
 	}
-	return ""
+	if len(rctx.RoutePatterns) <= mountDepth {
+		return ""
+	}
+	sub := rctx.RoutePatterns[mountDepth:]
+	if strings.HasSuffix(sub[len(sub)-1], "*") {
+		return ""
+	}
+	p := strings.Join(sub, "")
+	for strings.Contains(p, "/*/") {
+		p = strings.ReplaceAll(p, "/*/", "/")
+	}
+	p = strings.TrimSuffix(p, "/*")
+	if p != "/" {
+		p = strings.TrimSuffix(p, "//")
+		p = strings.TrimSuffix(p, "/")
+	}
+	return p
 }
 
 // auditRoute maps a matched route to the administrative mutation it represents.
